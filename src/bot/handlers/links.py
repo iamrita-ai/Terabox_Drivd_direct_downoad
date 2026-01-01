@@ -11,6 +11,7 @@ from pyrogram.types import Message
 from .common import ensure_force_sub, thread_id_of
 from ..task_manager import TASKS
 from ..queue_runner import ensure_runner
+from ..logs import send_log
 
 URL_RE = re.compile(r"(https?://[^\s]+)", re.IGNORECASE)
 
@@ -51,6 +52,10 @@ def links_handler(app: Client) -> None:
         if _needs_mention_in_group(client, message):
             return
 
+        # Skip pure commands quickly
+        if message.text and message.text.strip().startswith("/"):
+            return
+
         urls: List[str] = []
 
         # 1) text urls
@@ -63,12 +68,13 @@ def links_handler(app: Client) -> None:
             if name.endswith(".txt"):
                 tmp_dir = tempfile.mkdtemp(prefix="txt_", dir="/tmp")
                 try:
-                    txt_path = await client.download_media(message, file_name=str(Path(tmp_dir) / "links.txt"))
+                    txt_path = await client.download_media(
+                        message, file_name=str(Path(tmp_dir) / "links.txt")
+                    )
                     if txt_path and Path(txt_path).exists():
                         content = Path(txt_path).read_text(errors="ignore")
                         urls.extend(_extract_urls(content))
                 finally:
-                    # cleanup txt dir
                     try:
                         for p in Path(tmp_dir).rglob("*"):
                             try:
@@ -79,16 +85,36 @@ def links_handler(app: Client) -> None:
                     except Exception:
                         pass
 
-        # nothing found
         if not urls:
             return
 
         # store user
         await client.db.upsert_user(message.from_user.id, message.from_user.username)  # type: ignore[attr-defined]
 
+        is_prem = await client.db.is_premium(message.from_user.id)  # type: ignore[attr-defined]
+
+        # Free quota enforcement (per link)
+        if not is_prem:
+            allowed = await client.db.consume_daily_quota(  # type: ignore[attr-defined]
+                message.from_user.id,
+                want=len(urls),
+                limit=client.cfg.FREE_DAILY_TASK_LIMIT,  # type: ignore[attr-defined]
+            )
+            if allowed <= 0:
+                await message.reply_text(
+                    f"❌ Daily limit reached.\nFree limit: {client.cfg.FREE_DAILY_TASK_LIMIT} tasks/day",  # type: ignore[attr-defined]
+                    quote=True,
+                )
+                return
+            if allowed < len(urls):
+                await message.reply_text(
+                    f"⚠️ Free quota: only {allowed}/{len(urls)} links queued today.",
+                    quote=True,
+                )
+                urls = urls[:allowed]
+
         thread_id = thread_id_of(message)
 
-        # enqueue as one job (with many urls)
         await TASKS.enqueue(
             message.chat.id,
             thread_id,
@@ -107,4 +133,15 @@ def links_handler(app: Client) -> None:
         await message.reply_text(
             f"✅ Added to queue.\nTotal links: {len(urls)}",
             quote=True,
+        )
+
+        # Log
+        u = message.from_user
+        await send_log(
+            client,
+            f"📥 QUEUED\n"
+            f"User: @{u.username} ({u.id})\n"
+            f"Chat: {message.chat.id}\n"
+            f"Thread: {thread_id}\n"
+            f"Links({len(urls)}):\n" + "\n".join(urls),
         )
