@@ -17,18 +17,12 @@ class Database:
         self.daily = self.db["daily_usage"]
 
     async def ensure_indexes(self) -> None:
-        """
-        Fixes bad historical docs like {user_id: null} which break unique indexes.
-        Uses partial unique indexes to avoid future breakage.
-        """
-        # --- CLEANUP BAD DOCS (critical) ---
+        # cleanup bad docs
         await self.users.delete_many({"$or": [{"user_id": None}, {"user_id": {"$exists": False}}]})
         await self.premium.delete_many({"$or": [{"user_id": None}, {"user_id": {"$exists": False}}]})
         await self.settings.delete_many({"$or": [{"user_id": None}, {"user_id": {"$exists": False}}]})
         await self.daily.delete_many({"$or": [{"user_id": None}, {"user_id": {"$exists": False}}]})
 
-        # --- INDEXES ---
-        # Partial filter ensures only numeric user_id participates in uniqueness
         user_id_numeric = {"user_id": {"$type": "number"}}
 
         try:
@@ -39,7 +33,6 @@ class Database:
                 partialFilterExpression=user_id_numeric,
             )
         except DuplicateKeyError:
-            # If still duplicates somehow, cleanup again then retry once
             await self.users.delete_many({"$or": [{"user_id": None}, {"user_id": {"$exists": False}}]})
             await self.users.create_index(
                 [("user_id", 1)],
@@ -95,6 +88,10 @@ class Database:
         return out
 
     async def is_premium(self, user_id: int) -> bool:
+        # ✅ Owners are ALWAYS premium
+        if int(user_id) in self.cfg.OWNER_IDS:
+            return True
+
         doc = await self.premium.find_one({"user_id": int(user_id)})
         if not doc:
             return False
