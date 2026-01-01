@@ -20,9 +20,11 @@ def build_bot_app() -> Client:
         workers=50,
     )
 
+    # Attach config/db
     app.cfg = cfg  # type: ignore[attr-defined]
     app.db = db    # type: ignore[attr-defined]
 
+    # Register handlers
     from .handlers.start import start_handler
     from .handlers.help import help_handler
     from .handlers.cancel import cancel_handler
@@ -38,17 +40,5 @@ def build_bot_app() -> Client:
     premium_handler(app)
     broadcast_handler(app)
     settings_handler(app)
-
-    @app.on_start()
-    async def _on_start(_: Client):
-        log.info("Bot starting...")
-        await app.db.ensure_indexes()  # type: ignore[attr-defined]
-        me = await app.get_me()
-        log.info("Logged in as @%s", me.username)
-        log.info("Mongo indexes ensured.")
-
-    @app.on_stop()
-    async def _on_stop(_: Client):
-        log.info("Bot stopped.")
 
     return app
