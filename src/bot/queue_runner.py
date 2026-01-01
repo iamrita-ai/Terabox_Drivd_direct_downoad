@@ -24,7 +24,6 @@ from .logs import send_log
 
 log = logging.getLogger("queue_runner")
 
-
 VIDEO_EXT = {"mp4", "mkv", "mov", "webm", "avi"}
 
 
@@ -52,9 +51,6 @@ def _classify(path: str) -> str:
 
 
 def _remux_to_mp4(in_path: str, out_path: str) -> bool:
-    """
-    Remux (no re-encode) for better Telegram streaming.
-    """
     try:
         subprocess.run(
             ["ffmpeg", "-y", "-i", in_path, "-c", "copy", "-movflags", "+faststart", out_path],
@@ -68,16 +64,12 @@ def _remux_to_mp4(in_path: str, out_path: str) -> bool:
 
 
 async def _resolve_thumb_value_to_path(client: Client, value: str, out_path: str) -> Optional[str]:
-    """
-    value can be URL or Telegram file_id. Returns local jpg path if possible.
-    """
     try:
         if value.startswith("http://") or value.startswith("https://"):
             r = requests.get(value, timeout=30)
             r.raise_for_status()
             Path(out_path).write_bytes(r.content)
             return out_path if os.path.exists(out_path) else None
-        # assume Telegram file_id
         p = await client.download_media(value, file_name=out_path)
         return p if p and os.path.exists(p) else None
     except Exception:
@@ -85,28 +77,37 @@ async def _resolve_thumb_value_to_path(client: Client, value: str, out_path: str
 
 
 async def ensure_runner(client: Client, chat_id: int, thread_id: Optional[int]) -> None:
+    # If stale runner exists, TaskManager.has_runner() will auto clean it.
     if TASKS.has_runner(chat_id, thread_id):
         return
 
     cancel_event = asyncio.Event()
 
     async def _run():
+        key = (chat_id, thread_id)
         q = TASKS.get_queue(chat_id, thread_id)
-        while True:
-            item = await q.get()
-            try:
-                await _process_job(client, item, cancel_event)
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                log.exception("Job failed: %r", e)
-            finally:
-                q.task_done()
+        try:
+            while True:
+                item = await q.get()
+                try:
+                    await _process_job(client, item, cancel_event)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    log.exception("Job failed: %r", e)
+                    # best-effort notify in log channel
+                    try:
+                        await send_log(client, f"❌ JOB CRASHED (runner)\nKey: {key}\nErr: {e!r}")
+                    except Exception:
+                        pass
+                finally:
+                    q.task_done()
 
-            if q.empty():
-                break
-
-        TASKS.runners.pop((chat_id, thread_id), None)
+                if q.empty():
+                    break
+        finally:
+            # ALWAYS cleanup runner record
+            TASKS.runners.pop(key, None)
 
     task = asyncio.create_task(_run())
     TASKS.set_runner(chat_id, thread_id, RunningTask(task=task, cancel_event=cancel_event))
@@ -118,6 +119,7 @@ async def _process_job(client: Client, item: dict, cancel_event: asyncio.Event) 
     origin_msg_id = item.get("origin_msg_id")
     from_user_id = item.get("from_user_id")
     from_username = item.get("from_username")
+    chat_type = item.get("chat_type")  # "private" / "group" / "supergroup" / etc
     links: List[str] = item.get("links", [])
 
     total_tasks = len(links)
@@ -132,12 +134,11 @@ async def _process_job(client: Client, item: dict, cancel_event: asyncio.Event) 
 
     settings = await client.db.get_settings(from_user_id)  # type: ignore[attr-defined]
     custom_title = (settings.get("title") or "").strip() or None
-    user_thumb_file_id = settings.get("thumb_file_id")  # optional (premium-only set)
+    user_thumb_file_id = settings.get("thumb_file_id")
 
-    # Where to deliver results:
-    # In topic threads, keep same chat/thread (don't redirect).
+    # IMPORTANT: redirect only if request came from PRIVATE chat
     deliver_chat_id = chat_id
-    if thread_id is None:
+    if chat_type == "private" and thread_id is None:
         tc = settings.get("target_chat_id")
         if isinstance(tc, int):
             deliver_chat_id = tc
@@ -164,7 +165,7 @@ async def _process_job(client: Client, item: dict, cancel_event: asyncio.Event) 
     await send_log(
         client,
         f"🚀 JOB START\nUser: @{from_username} ({from_user_id})\n"
-        f"Chat: {chat_id}\nDeliver: {deliver_chat_id}\nThread: {thread_id}\n"
+        f"Chat: {chat_id} ({chat_type})\nDeliver: {deliver_chat_id}\nThread: {thread_id}\n"
         f"Premium: {is_prem}\nLinks({len(links)}):\n" + "\n".join(links),
     )
 
@@ -177,7 +178,6 @@ async def _process_job(client: Client, item: dict, cancel_event: asyncio.Event) 
             str(Path(work_dir) / "pdf_env_thumb.jpg"),
         )
 
-    # Cache user thumb file_id (once per job)
     cached_user_thumb: Optional[str] = None
     if user_thumb_file_id:
         cached_user_thumb = await _resolve_thumb_value_to_path(
@@ -197,7 +197,7 @@ async def _process_job(client: Client, item: dict, cancel_event: asyncio.Event) 
         link_dir = str(Path(work_dir) / f"link_{idx}")
         os.makedirs(link_dir, exist_ok=True)
 
-        # thread-safe progress edit from downloader thread
+        # progress edits from downloader thread -> schedule safely
         last_text = {"v": ""}
 
         def on_progress_text(t: str) -> None:
@@ -209,9 +209,9 @@ async def _process_job(client: Client, item: dict, cancel_event: asyncio.Event) 
             except Exception:
                 pass
 
-        # Download (thread)
+        # Download in thread
         try:
-            file_path, filename = await asyncio.to_thread(
+            await asyncio.to_thread(
                 download_any,
                 url,
                 link_dir,
@@ -225,10 +225,7 @@ async def _process_job(client: Client, item: dict, cancel_event: asyncio.Event) 
             failed += 1
             failed_links.append((url, str(e)))
             await edit_status(f"❌ Failed task {idx}/{total_tasks}\n{url}\nReason: {e}")
-            await send_log(
-                client,
-                f"❌ LINK FAILED\nUser: @{from_username} ({from_user_id})\nURL: {url}\nReason: {e}",
-            )
+            await send_log(client, f"❌ LINK FAILED\nUser: @{from_username} ({from_user_id})\nURL: {url}\nReason: {e}")
             rm_any(link_dir)
             continue
 
@@ -260,10 +257,7 @@ async def _process_job(client: Client, item: dict, cancel_event: asyncio.Event) 
             fname = Path(sp).name
             ext = _ext(sp)
 
-            # Thumbnail decision:
-            # - PDF: env PDF_THUMB priority
-            # - Else: user setting thumb if set
-            # - Else: generated thumb
+            # Thumb priority
             thumb_path = None
             if ext == "pdf" and cached_pdf_thumb and os.path.exists(cached_pdf_thumb):
                 thumb_path = cached_pdf_thumb
@@ -284,8 +278,7 @@ async def _process_job(client: Client, item: dict, cancel_event: asyncio.Event) 
                 txt = format_progress("Uploading", fname, current, total, state)
                 client.loop.create_task(edit_status(txt))  # type: ignore[attr-defined]
 
-            # Video must be playable: send as VIDEO (streaming enabled)
-            # Optional remux to mp4 for better streaming.
+            # Playable video: send_video + supports_streaming
             send_path_final = sp
             remux_tmp = None
             if _is_video(sp) and client.cfg.REMUX_TO_MP4 and ext != "mp4":  # type: ignore[attr-defined]
@@ -317,20 +310,11 @@ async def _process_job(client: Client, item: dict, cancel_event: asyncio.Event) 
                     )
 
                 counters[_classify(send_path_final)] += 1
-                await send_log(
-                    client,
-                    f"📤 SENT\nUser: @{from_username} ({from_user_id})\n"
-                    f"File: {Path(send_path_final).name}\nFrom URL: {url}",
-                )
             except Exception as e:
                 failed += 1
                 failed_links.append((url, f"Upload error: {e}"))
                 await edit_status(f"❌ Upload failed: {fname}\nReason: {e}")
-                await send_log(
-                    client,
-                    f"❌ UPLOAD FAILED\nUser: @{from_username} ({from_user_id})\n"
-                    f"File: {fname}\nURL: {url}\nReason: {e}",
-                )
+                await send_log(client, f"❌ UPLOAD FAILED\nUser: @{from_username} ({from_user_id})\nFile: {fname}\nURL: {url}\nReason: {e}")
 
             # cleanup
             if remux_tmp:
@@ -355,7 +339,6 @@ async def _process_job(client: Client, item: dict, cancel_event: asyncio.Event) 
     )
     await edit_status(summary)
 
-    # detailed log summary
     fail_lines = "\n".join([f"- {u} => {r}" for u, r in failed_links[:25]])
     await send_log(
         client,
