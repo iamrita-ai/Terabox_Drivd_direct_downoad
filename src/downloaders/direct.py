@@ -27,19 +27,24 @@ def download_direct(
     url: str,
     out_dir: str,
     *,
-    on_progress_text,  # callable(text:str) -> None
+    on_progress_text,
     interval_sec: int = 8,
     cancel_event=None,
     max_bytes: Optional[int] = None,
     rate_limit_bps: Optional[float] = None,
+    headers: Optional[dict] = None,
+    session: Optional[requests.Session] = None,
 ) -> Tuple[str, str]:
     """
     Returns (file_path, filename). Runs sync.
-    rate_limit_bps: if set, throttles average speed (best-effort).
+    - headers/session added for hosts like TeraBox that require Referer/Cookies.
     """
     os.makedirs(out_dir, exist_ok=True)
 
-    with requests.get(url, stream=True, allow_redirects=True, timeout=30) as r:
+    sess = session or requests.Session()
+    req_headers = headers or {}
+
+    with sess.get(url, stream=True, allow_redirects=True, timeout=30, headers=req_headers) as r:
         r.raise_for_status()
 
         total = r.headers.get("content-length")
@@ -78,9 +83,7 @@ def download_direct(
                 now = time.time()
                 if now - state.last_edit_ts >= interval_sec:
                     state.last_edit_ts = now
-                    on_progress_text(
-                        format_progress("Downloading", filename, done, total_int, state)
-                    )
+                    on_progress_text(format_progress("Downloading", filename, done, total_int, state))
 
         on_progress_text(format_progress("Downloading", filename, done, total_int, state))
         return out_path, filename
