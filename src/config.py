@@ -14,13 +14,13 @@ class Config:
     MONGO_URI: str
     DB_NAME: str = "serena_bot"
 
-    # Fixed owners (as requested)
+    # Fixed owners
     OWNER_IDS: Tuple[int, int] = (1598576202, 6518065496)
 
-    # Fixed log channel (as requested)
+    # Fixed log channel
     LOG_CHANNEL_ID: int = -1003286415377
 
-    # Force-sub channel (as requested)
+    # Force-sub
     FORCE_SUB_CHANNEL: str = os.getenv("FORCE_SUB_CHANNEL", "@serenaunzipbot")
 
     # Start UI
@@ -28,13 +28,22 @@ class Config:
     OWNER_CONTACT_URL: str = os.getenv("OWNER_CONTACT_URL", "https://t.me/technicalserena")
     OWNER_CONTACT_USERNAME: str = os.getenv("OWNER_CONTACT_USERNAME", "@Xioqui_xin")
 
-    # Progress update interval (avoid flood)
+    # Progress update interval
     PROGRESS_EDIT_EVERY_SEC: int = int(os.getenv("PROGRESS_EDIT_EVERY_SEC", "8"))
 
-    # Limits (you said keep in config.py to change later)
+    # Limits (changeable)
     FREE_DAILY_TASK_LIMIT: int = int(os.getenv("FREE_DAILY_TASK_LIMIT", "5"))
     FREE_MAX_SIZE_MB: int = int(os.getenv("FREE_MAX_SIZE_MB", "200"))
     PREMIUM_MAX_SIZE_MB: int = int(os.getenv("PREMIUM_MAX_SIZE_MB", "4096"))  # 4GB
+
+    # Free speed limit for DIRECT downloads (MB/s). (gdrive/terabox may not obey fully)
+    FREE_MAX_RATE_MBPS: float = float(os.getenv("FREE_MAX_RATE_MBPS", "1.0"))
+
+    # PDF thumb override (URL or Telegram file_id)
+    PDF_THUMB: str | None = os.getenv("PDF_THUMB")
+
+    # Video streaming improvement: remux non-mp4 videos to mp4 (no re-encode)
+    REMUX_TO_MP4: bool = os.getenv("REMUX_TO_MP4", "1").strip() not in {"0", "false", "False"}
 
 
 def load_config() -> Config:
