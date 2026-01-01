@@ -17,6 +17,7 @@ class TBItem:
     name: str
     path: str
     size: int
+    fs_id: Optional[int] = None
     dlink: Optional[str] = None
 
 
@@ -43,14 +44,70 @@ def _tb_session() -> requests.Session:
                       "(KHTML, like Gecko) Chrome/120 Safari/537.36",
         "accept": "application/json,text/plain,*/*",
     })
+
+    # Optional cookies from env
+    ck = os.getenv("TERABOX_COOKIES", "").strip()
+    if ck:
+        # naive cookie parse: "a=b; c=d"
+        for part in ck.split(";"):
+            part = part.strip()
+            if not part or "=" not in part:
+                continue
+            k, v = part.split("=", 1)
+            s.cookies.set(k.strip(), v.strip())
+
     return s
 
 
+def _fetch_share_page(sess: requests.Session, surl: str) -> str:
+    # share page
+    page_url = f"https://www.terabox.com/s/{surl}"
+    r = sess.get(page_url, timeout=30, headers={"referer": "https://www.terabox.com/"})
+    r.raise_for_status()
+    return r.text
+
+
+def _extract_meta(html: str) -> Tuple[str, str, str, str]:
+    """
+    Extract sign, timestamp, shareid, uk from share page html.
+    Multiple regex fallbacks.
+    """
+    # sign
+    sign = None
+    for pat in [r'"sign"\s*:\s*"([^"]+)"', r"sign\s*:\s*'([^']+)'", r"sign\s*=\s*\"([^\"]+)\""]:
+        m = re.search(pat, html)
+        if m:
+            sign = m.group(1)
+            break
+
+    ts = None
+    for pat in [r'"timestamp"\s*:\s*(\d+)', r"timestamp\s*:\s*'(\d+)'", r"timestamp\s*=\s*(\d+)"]:
+        m = re.search(pat, html)
+        if m:
+            ts = m.group(1)
+            break
+
+    shareid = None
+    for pat in [r'"shareid"\s*:\s*(\d+)', r'"share_id"\s*:\s*(\d+)', r"shareid\s*=\s*(\d+)"]:
+        m = re.search(pat, html)
+        if m:
+            shareid = m.group(1)
+            break
+
+    uk = None
+    for pat in [r'"uk"\s*:\s*(\d+)', r"uk\s*=\s*(\d+)"]:
+        m = re.search(pat, html)
+        if m:
+            uk = m.group(1)
+            break
+
+    if not (sign and ts and shareid and uk):
+        raise RuntimeError("TeraBox: could not extract sign/timestamp/shareid/uk (share may require login)")
+
+    return sign, ts, shareid, uk
+
+
 def _list_dir(sess: requests.Session, surl: str, dir_path: str = "/") -> List[TBItem]:
-    """
-    Best-effort: tries share/list and hopes dlink is present.
-    If dlink not returned, it will fail (some shares require extra signing/cookies).
-    """
     url = "https://www.terabox.com/share/list"
     params = {
         "app_id": "250528",
@@ -59,18 +116,19 @@ def _list_dir(sess: requests.Session, surl: str, dir_path: str = "/") -> List[TB
         "clienttype": "0",
         "shorturl": surl,
         "root": "1",
-        "dir": dir_path if dir_path != "/" else "",
+        "dir": "" if dir_path == "/" else dir_path,
         "num": "1000",
         "page": "1",
         "order": "name",
         "desc": "0",
     }
-    r = sess.get(url, params=params, timeout=30)
+    r = sess.get(url, params=params, timeout=30, headers={"referer": f"https://www.terabox.com/s/{surl}"})
     r.raise_for_status()
     data: Dict[str, Any] = r.json()
 
-    if data.get("errno") not in (0, "0", None):
-        raise RuntimeError(f"TeraBox list error: {data.get('errno')}")
+    errno = data.get("errno", 0)
+    if str(errno) != "0":
+        raise RuntimeError(f"TeraBox list error: errno={errno}")
 
     lst = data.get("list") or []
     out: List[TBItem] = []
@@ -81,6 +139,7 @@ def _list_dir(sess: requests.Session, surl: str, dir_path: str = "/") -> List[TB
                 name=str(x.get("server_filename") or x.get("name") or "file"),
                 path=str(x.get("path") or ""),
                 size=int(x.get("size") or 0),
+                fs_id=int(x.get("fs_id")) if x.get("fs_id") is not None else None,
                 dlink=x.get("dlink"),
             )
         )
@@ -98,6 +157,39 @@ def _walk(sess: requests.Session, surl: str, dir_path: str = "/") -> List[TBItem
     return files
 
 
+def _get_dlink(sess: requests.Session, surl: str, fs_id: int, sign: str, timestamp: str, shareid: str, uk: str) -> str:
+    """
+    Calls share/download to get dlink.
+    """
+    url = "https://www.terabox.com/share/download"
+    params = {
+        "app_id": "250528",
+        "channel": "dubox",
+        "clienttype": "0",
+        "web": "1",
+        "shorturl": surl,
+        "sign": sign,
+        "timestamp": timestamp,
+        "shareid": shareid,
+        "uk": uk,
+        "fid_list": f"[{fs_id}]",
+    }
+    r = sess.get(url, params=params, timeout=30, headers={"referer": f"https://www.terabox.com/s/{surl}"})
+    r.raise_for_status()
+    data = r.json()
+    errno = data.get("errno", 0)
+    if str(errno) != "0":
+        raise RuntimeError(f"TeraBox download-api error: errno={errno}")
+
+    dlink = data.get("dlink")
+    if not dlink and isinstance(data.get("list"), list) and data["list"]:
+        dlink = data["list"][0].get("dlink")
+
+    if not dlink:
+        raise RuntimeError("TeraBox: could not obtain dlink (share may require login/cookies)")
+    return str(dlink)
+
+
 def download_terabox(
     url: str,
     out_dir: str,
@@ -109,14 +201,16 @@ def download_terabox(
     rate_limit_bps: Optional[float] = None,
 ) -> Tuple[str, str]:
     """
-    Downloads all files found in the share (folder supported best-effort).
-    Saves into out_dir. Returns (first_file_path, first_file_name).
-
-    Note: If share/list does not provide dlink, this may fail on some links.
+    Best-effort public TeraBox share download (no Telegram session needed).
+    Works for many shares; some may still require login/cookies.
+    Downloads all files in share (folder supported) into out_dir.
     """
     os.makedirs(out_dir, exist_ok=True)
     surl = _extract_surl(url)
     sess = _tb_session()
+
+    html = _fetch_share_page(sess, surl)
+    sign, timestamp, shareid, uk = _extract_meta(html)
 
     items = _walk(sess, surl, dir_path="/")
     if not items:
@@ -125,24 +219,38 @@ def download_terabox(
     first_path = ""
     first_name = ""
 
+    # headers that often help TeraBox dlinks
+    dl_headers = {
+        "referer": f"https://www.terabox.com/s/{surl}",
+        "user-agent": sess.headers.get("user-agent", ""),
+    }
+
     for idx, it in enumerate(items, start=1):
         if cancel_event and cancel_event.is_set():
             raise RuntimeError("Cancelled")
 
-        if max_bytes and it.size and it.size > max_bytes:
+        if it.isdir == 1:
+            continue
+
+        if it.size and max_bytes and it.size > max_bytes:
             raise RuntimeError(f"TeraBox file too large: {it.size} bytes > limit")
 
-        if not it.dlink:
-            raise RuntimeError("TeraBox: dlink not available for this share (needs sign/cookies)")
+        dlink = it.dlink
+        if not dlink:
+            if not it.fs_id:
+                raise RuntimeError("TeraBox: missing fs_id for file")
+            dlink = _get_dlink(sess, surl, it.fs_id, sign, timestamp, shareid, uk)
 
         p, n = download_direct(
-            it.dlink,
+            dlink,
             out_dir,
             on_progress_text=on_progress_text,
             interval_sec=interval_sec,
             cancel_event=cancel_event,
             max_bytes=max_bytes,
             rate_limit_bps=rate_limit_bps,
+            headers=dl_headers,
+            session=sess,
         )
 
         if idx == 1:
