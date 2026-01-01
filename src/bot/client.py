@@ -29,15 +29,19 @@ def build_bot_app() -> Client:
     from .handlers.start import start_handler
     from .handlers.help import help_handler
     from .handlers.cancel import cancel_handler
+    from .handlers.links import links_handler
 
     start_handler(app)
     help_handler(app)
     cancel_handler(app)
+    links_handler(app)
 
     @app.on_start()
     async def _on_start(_: Client):
         log.info("Bot starting...")
         await app.db.ensure_indexes()  # type: ignore[attr-defined]
+        me = await app.get_me()
+        log.info("Logged in as @%s", me.username)
         log.info("Mongo indexes ensured.")
 
     @app.on_stop()
