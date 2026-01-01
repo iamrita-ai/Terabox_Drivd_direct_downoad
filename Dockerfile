@@ -5,14 +5,18 @@ ENV PYTHONUNBUFFERED=1
 
 WORKDIR /app
 
-# (Part-2/3 me ffmpeg/pymupdf etc add karenge. Abhi minimal.)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ffmpeg \
+    zip \
+    unzip \
+    p7zip-full \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
 COPY . /app
 
-# Render sets PORT
 EXPOSE 10000
-
 CMD ["python", "app.py"]
