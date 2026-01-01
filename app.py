@@ -1,4 +1,3 @@
-
 import os
 import threading
 import asyncio
@@ -12,19 +11,37 @@ BOT_STATUS = {"ok": False, "error": None}
 
 
 def run_bot() -> None:
-    # IMPORTANT: create an event loop for this thread (Python 3.11+ requirement)
+    # Create an event loop for this thread (Python 3.11+)
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
-    try:
+    async def main():
         app = build_bot_app()
-        BOT_STATUS["ok"] = True
-        BOT_STATUS["error"] = None
-        app.run()  # blocking
+
+        await app.start()
+        try:
+            await app.db.ensure_indexes()  # type: ignore[attr-defined]
+            me = await app.get_me()
+            BOT_STATUS["ok"] = True
+            BOT_STATUS["error"] = None
+            # Keep running
+            from pyrogram import idle
+            await idle()
+        finally:
+            BOT_STATUS["ok"] = False
+            await app.stop()
+
+    try:
+        loop.run_until_complete(main())
     except Exception:
         BOT_STATUS["ok"] = False
         BOT_STATUS["error"] = traceback.format_exc()
         raise
+    finally:
+        try:
+            loop.close()
+        except Exception:
+            pass
 
 
 def create_web() -> Flask:
