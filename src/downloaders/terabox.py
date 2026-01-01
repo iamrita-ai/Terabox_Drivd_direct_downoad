@@ -21,23 +21,11 @@ class TBItem:
     dlink: Optional[str] = None
 
 
-_SURL_RE = re.compile(r"/s/([A-Za-z0-9_-]+)")
-
-
-def _extract_surl(url: str) -> str:
-    u = url.strip()
-    m = _SURL_RE.search(urlparse(u).path)
-    if m:
-        return m.group(1)
-
-    qs = parse_qs(urlparse(u).query)
-    for key in ("surl", "shorturl"):
-        if key in qs and qs[key]:
-            return qs[key][0]
-    raise RuntimeError("TeraBox: surl/shorturl not found in link")
-
-
-def _tb_session() -> requests.Session:
+def _tb_session() -> Tuple[requests.Session, Optional[str]]:
+    """
+    Returns (session, cookie_header_string_or_none)
+    We prefer forcing Cookie header because requests' cookie jar can be domain-restricted.
+    """
     s = requests.Session()
     s.headers.update({
         "user-agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
@@ -45,84 +33,136 @@ def _tb_session() -> requests.Session:
         "accept": "application/json,text/plain,*/*",
     })
 
-    # Optional cookies from env
     ck = os.getenv("TERABOX_COOKIES", "").strip()
     if ck:
-        # naive cookie parse: "a=b; c=d"
-        for part in ck.split(";"):
-            part = part.strip()
-            if not part or "=" not in part:
-                continue
-            k, v = part.split("=", 1)
-            s.cookies.set(k.strip(), v.strip())
+        # force cookie header for all requests
+        s.headers["cookie"] = ck
+        return s, ck
 
-    return s
+    return s, None
 
 
-def _fetch_share_page(sess: requests.Session, surl: str) -> str:
-    # share page
-    page_url = f"https://www.terabox.com/s/{surl}"
-    r = sess.get(page_url, timeout=30, headers={"referer": "https://www.terabox.com/"})
+def _parse_terabox_link(url: str) -> Tuple[str, str, Optional[int], Optional[str], Optional[str]]:
+    """
+    Returns: (base, surl, fsid, dir_path, file_name)
+    base keeps the same domain (1024tera vs terabox) so endpoints match the share.
+    """
+    u = url.strip()
+    pu = urlparse(u)
+    qs = parse_qs(pu.query)
+
+    base = f"{pu.scheme or 'https'}://{pu.netloc}"
+
+    surl = None
+    if "surl" in qs and qs["surl"]:
+        surl = qs["surl"][0]
+    else:
+        # also support /s/<surl>
+        m = re.search(r"/s/([A-Za-z0-9_-]+)", pu.path)
+        if m:
+            surl = m.group(1)
+
+    if not surl:
+        raise RuntimeError("TeraBox: surl not found in link")
+
+    fsid = None
+    if "fsid" in qs and qs["fsid"] and qs["fsid"][0].isdigit():
+        fsid = int(qs["fsid"][0])
+
+    dir_path = qs.get("dir", [None])[0]
+    file_name = qs.get("fileName", [None])[0]
+
+    return base, surl, fsid, dir_path, file_name
+
+
+def _fetch_html(sess: requests.Session, url: str, referer: str) -> str:
+    r = sess.get(url, timeout=30, headers={"referer": referer})
     r.raise_for_status()
     return r.text
 
 
 def _extract_meta(html: str) -> Tuple[str, str, str, str]:
     """
-    Extract sign, timestamp, shareid, uk from share page html.
-    Multiple regex fallbacks.
+    Extract sign, timestamp, shareid, uk from various terabox/1024tera page patterns.
     """
     # sign
     sign = None
-    for pat in [r'"sign"\s*:\s*"([^"]+)"', r"sign\s*:\s*'([^']+)'", r"sign\s*=\s*\"([^\"]+)\""]:
+    for pat in [
+        r'"sign"\s*:\s*"([^"]+)"',
+        r"sign\s*:\s*'([^']+)'",
+        r"sign\s*:\s*\"([^\"]+)\"",
+        r"sign\s*=\s*\"([^\"]+)\"",
+        r"sign\s*=\s*'([^']+)'",
+    ]:
         m = re.search(pat, html)
         if m:
             sign = m.group(1)
             break
 
+    # timestamp
     ts = None
-    for pat in [r'"timestamp"\s*:\s*(\d+)', r"timestamp\s*:\s*'(\d+)'", r"timestamp\s*=\s*(\d+)"]:
+    for pat in [
+        r'"timestamp"\s*:\s*(\d+)',
+        r"timestamp\s*:\s*'(\d+)'",
+        r"timestamp\s*:\s*(\d+)",
+        r"timestamp\s*=\s*(\d+)",
+    ]:
         m = re.search(pat, html)
         if m:
             ts = m.group(1)
             break
 
+    # shareid
     shareid = None
-    for pat in [r'"shareid"\s*:\s*(\d+)', r'"share_id"\s*:\s*(\d+)', r"shareid\s*=\s*(\d+)"]:
+    for pat in [
+        r'"shareid"\s*:\s*(\d+)',
+        r'"share_id"\s*:\s*(\d+)',
+        r'"shareId"\s*:\s*(\d+)',
+        r"shareid\s*=\s*(\d+)",
+    ]:
         m = re.search(pat, html)
         if m:
             shareid = m.group(1)
             break
 
+    # uk
     uk = None
-    for pat in [r'"uk"\s*:\s*(\d+)', r"uk\s*=\s*(\d+)"]:
+    for pat in [
+        r'"uk"\s*:\s*(\d+)',
+        r'"share_uk"\s*:\s*(\d+)',
+        r"uk\s*=\s*(\d+)",
+    ]:
         m = re.search(pat, html)
         if m:
             uk = m.group(1)
             break
 
     if not (sign and ts and shareid and uk):
-        raise RuntimeError("TeraBox: could not extract sign/timestamp/shareid/uk (share may require login)")
+        raise RuntimeError("TeraBox: could not extract sign/timestamp/shareid/uk (needs cookies/login or page pattern changed)")
 
     return sign, ts, shareid, uk
 
 
-def _list_dir(sess: requests.Session, surl: str, dir_path: str = "/") -> List[TBItem]:
-    url = "https://www.terabox.com/share/list"
+def _list_dir(sess: requests.Session, base: str, surl: str, dir_path: Optional[str]) -> List[TBItem]:
+    url = f"{base}/share/list"
+
+    # root=1 for root listing; for dir listing root=0 usually works better
+    is_root = (not dir_path) or (dir_path == "/")
     params = {
         "app_id": "250528",
         "web": "1",
         "channel": "dubox",
         "clienttype": "0",
         "shorturl": surl,
-        "root": "1",
-        "dir": "" if dir_path == "/" else dir_path,
+        "root": "1" if is_root else "0",
+        "dir": "" if is_root else (dir_path or ""),
         "num": "1000",
         "page": "1",
         "order": "name",
         "desc": "0",
     }
-    r = sess.get(url, params=params, timeout=30, headers={"referer": f"https://www.terabox.com/s/{surl}"})
+
+    r = sess.get(url, params=params, timeout=30, headers={"referer": f"{base}/s/{surl}"})
     r.raise_for_status()
     data: Dict[str, Any] = r.json()
 
@@ -146,22 +186,19 @@ def _list_dir(sess: requests.Session, surl: str, dir_path: str = "/") -> List[TB
     return out
 
 
-def _walk(sess: requests.Session, surl: str, dir_path: str = "/") -> List[TBItem]:
-    items = _list_dir(sess, surl, dir_path=dir_path)
+def _walk(sess: requests.Session, base: str, surl: str, dir_path: Optional[str]) -> List[TBItem]:
+    items = _list_dir(sess, base, surl, dir_path)
     files: List[TBItem] = []
     for it in items:
         if it.isdir == 1 and it.path:
-            files.extend(_walk(sess, surl, dir_path=it.path))
+            files.extend(_walk(sess, base, surl, it.path))
         else:
             files.append(it)
     return files
 
 
-def _get_dlink(sess: requests.Session, surl: str, fs_id: int, sign: str, timestamp: str, shareid: str, uk: str) -> str:
-    """
-    Calls share/download to get dlink.
-    """
-    url = "https://www.terabox.com/share/download"
+def _get_dlink(sess: requests.Session, base: str, surl: str, fs_id: int, sign: str, timestamp: str, shareid: str, uk: str) -> str:
+    url = f"{base}/share/download"
     params = {
         "app_id": "250528",
         "channel": "dubox",
@@ -174,9 +211,15 @@ def _get_dlink(sess: requests.Session, surl: str, fs_id: int, sign: str, timesta
         "uk": uk,
         "fid_list": f"[{fs_id}]",
     }
-    r = sess.get(url, params=params, timeout=30, headers={"referer": f"https://www.terabox.com/s/{surl}"})
+
+    # try GET then POST (some variants prefer POST)
+    r = sess.get(url, params=params, timeout=30, headers={"referer": f"{base}/s/{surl}"})
+    if r.status_code >= 400:
+        r = sess.post(url, data=params, timeout=30, headers={"referer": f"{base}/s/{surl}"})
+
     r.raise_for_status()
     data = r.json()
+
     errno = data.get("errno", 0)
     if str(errno) != "0":
         raise RuntimeError(f"TeraBox download-api error: errno={errno}")
@@ -186,7 +229,7 @@ def _get_dlink(sess: requests.Session, surl: str, fs_id: int, sign: str, timesta
         dlink = data["list"][0].get("dlink")
 
     if not dlink:
-        raise RuntimeError("TeraBox: could not obtain dlink (share may require login/cookies)")
+        raise RuntimeError("TeraBox: could not obtain dlink (cookies may be missing/expired)")
     return str(dlink)
 
 
@@ -201,31 +244,51 @@ def download_terabox(
     rate_limit_bps: Optional[float] = None,
 ) -> Tuple[str, str]:
     """
-    Best-effort public TeraBox share download (no Telegram session needed).
-    Works for many shares; some may still require login/cookies.
-    Downloads all files in share (folder supported) into out_dir.
+    Supports:
+    - /s/<surl> share links
+    - sharing/videoPlay?surl=...&fsid=... (downloads that specific file)
+    - folder listing best-effort
     """
     os.makedirs(out_dir, exist_ok=True)
-    surl = _extract_surl(url)
-    sess = _tb_session()
+    base, surl, fsid, dir_path, file_name = _parse_terabox_link(url)
 
-    html = _fetch_share_page(sess, surl)
+    sess, _ = _tb_session()
+
+    referer = f"{base}/s/{surl}"
+
+    # 1) Try to extract meta from the exact page user sent (videoPlay often has meta)
+    html = None
+    try:
+        html = _fetch_html(sess, url, referer=referer)
+    except Exception:
+        html = None
+
+    # 2) Fallback to /s/<surl>
+    if not html:
+        html = _fetch_html(sess, f"{base}/s/{surl}", referer=base)
+
     sign, timestamp, shareid, uk = _extract_meta(html)
 
-    items = _walk(sess, surl, dir_path="/")
-    if not items:
+    # If fsid present (videoPlay link), download ONLY that file (fast + reliable)
+    targets: List[TBItem] = []
+    if fsid:
+        targets = [TBItem(isdir=0, name=file_name or "file", path=dir_path or "", size=0, fs_id=fsid)]
+    else:
+        targets = _walk(sess, base, surl, dir_path)
+
+    if not targets:
         raise RuntimeError("TeraBox: no files found")
 
     first_path = ""
     first_name = ""
 
-    # headers that often help TeraBox dlinks
     dl_headers = {
-        "referer": f"https://www.terabox.com/s/{surl}",
+        "referer": referer,
         "user-agent": sess.headers.get("user-agent", ""),
+        # Cookie header is already attached to session if TERABOX_COOKIES set.
     }
 
-    for idx, it in enumerate(items, start=1):
+    for idx, it in enumerate(targets, start=1):
         if cancel_event and cancel_event.is_set():
             raise RuntimeError("Cancelled")
 
@@ -235,11 +298,12 @@ def download_terabox(
         if it.size and max_bytes and it.size > max_bytes:
             raise RuntimeError(f"TeraBox file too large: {it.size} bytes > limit")
 
+        if not it.fs_id:
+            raise RuntimeError("TeraBox: missing fs_id")
+
         dlink = it.dlink
         if not dlink:
-            if not it.fs_id:
-                raise RuntimeError("TeraBox: missing fs_id for file")
-            dlink = _get_dlink(sess, surl, it.fs_id, sign, timestamp, shareid, uk)
+            dlink = _get_dlink(sess, base, surl, it.fs_id, sign, timestamp, shareid, uk)
 
         p, n = download_direct(
             dlink,
