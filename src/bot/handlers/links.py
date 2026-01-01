@@ -24,11 +24,9 @@ def _needs_mention_in_group(client: Client, msg: Message) -> bool:
     if msg.chat.type not in ("group", "supergroup"):
         return False
 
-    # allow if reply to bot
     if msg.reply_to_message and msg.reply_to_message.from_user and msg.reply_to_message.from_user.is_bot:
         return False
 
-    # allow if bot mentioned in text
     try:
         me = client.me or None
         username = (me.username if me else "") or ""
@@ -52,17 +50,14 @@ def links_handler(app: Client) -> None:
         if _needs_mention_in_group(client, message):
             return
 
-        # Skip pure commands quickly
         if message.text and message.text.strip().startswith("/"):
             return
 
         urls: List[str] = []
 
-        # 1) text urls
         if message.text:
             urls.extend(_extract_urls(message.text))
 
-        # 2) .txt document with urls
         if message.document and message.document.file_name:
             name = message.document.file_name.lower()
             if name.endswith(".txt"):
@@ -88,12 +83,9 @@ def links_handler(app: Client) -> None:
         if not urls:
             return
 
-        # store user
         await client.db.upsert_user(message.from_user.id, message.from_user.username)  # type: ignore[attr-defined]
-
         is_prem = await client.db.is_premium(message.from_user.id)  # type: ignore[attr-defined]
 
-        # Free quota enforcement (per link)
         if not is_prem:
             allowed = await client.db.consume_daily_quota(  # type: ignore[attr-defined]
                 message.from_user.id,
@@ -102,7 +94,7 @@ def links_handler(app: Client) -> None:
             )
             if allowed <= 0:
                 await message.reply_text(
-                    f"❌ Daily limit reached.\nFree limit: {client.cfg.FREE_DAILY_TASK_LIMIT} tasks/day",  # type: ignore[attr-defined]
+                    f"❌ Daily limit reached.\nFree limit: {client.cfg.FREE_DAILY_TASK_LIMIT} tasks/day",
                     quote=True,
                 )
                 return
@@ -120,6 +112,7 @@ def links_handler(app: Client) -> None:
             thread_id,
             {
                 "chat_id": message.chat.id,
+                "chat_type": message.chat.type,   # IMPORTANT
                 "thread_id": thread_id,
                 "origin_msg_id": message.id,
                 "from_user_id": message.from_user.id,
@@ -131,17 +124,16 @@ def links_handler(app: Client) -> None:
         await ensure_runner(client, message.chat.id, thread_id)
 
         await message.reply_text(
-            f"✅ Added to queue.\nTotal links: {len(urls)}",
+            f"✅ Added to queue.\nTotal links: {len(urls)}\n\n(Processing will start now...)",
             quote=True,
         )
 
-        # Log
         u = message.from_user
         await send_log(
             client,
             f"📥 QUEUED\n"
             f"User: @{u.username} ({u.id})\n"
-            f"Chat: {message.chat.id}\n"
+            f"Chat: {message.chat.id} ({message.chat.type})\n"
             f"Thread: {thread_id}\n"
             f"Links({len(urls)}):\n" + "\n".join(urls),
         )
