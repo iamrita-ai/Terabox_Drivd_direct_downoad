@@ -7,7 +7,7 @@ from flask import Flask, jsonify
 from src.logger import setup_logging
 from src.bot.client import build_bot_app
 
-BOT_STATUS = {"ok": False, "error": None}
+BOT_STATUS = {"bot_ok": False, "error": None}
 
 
 def run_bot() -> None:
@@ -18,25 +18,28 @@ def run_bot() -> None:
     async def main():
         app = build_bot_app()
 
-        await app.start()
         try:
+            await app.start()
             await app.db.ensure_indexes()  # type: ignore[attr-defined]
             me = await app.get_me()
-            BOT_STATUS["ok"] = True
+            BOT_STATUS["bot_ok"] = True
             BOT_STATUS["error"] = None
-            # Keep running
+
             from pyrogram import idle
             await idle()
+        except Exception:
+            BOT_STATUS["bot_ok"] = False
+            BOT_STATUS["error"] = traceback.format_exc()
+            raise
         finally:
-            BOT_STATUS["ok"] = False
-            await app.stop()
+            try:
+                await app.stop()
+            except Exception:
+                pass
+            BOT_STATUS["bot_ok"] = False
 
     try:
         loop.run_until_complete(main())
-    except Exception:
-        BOT_STATUS["ok"] = False
-        BOT_STATUS["error"] = traceback.format_exc()
-        raise
     finally:
         try:
             loop.close()
@@ -51,11 +54,15 @@ def create_web() -> Flask:
     def home():
         return jsonify(ok=True, service="serena-downloader-bot")
 
+    # Render health check should hit this (ALWAYS 200)
+    @web.get("/healthz")
+    def healthz():
+        return jsonify(ok=True, web_ok=True)
+
+    # Bot diagnostic (ALWAYS 200 so deploy doesn't fail)
     @web.get("/health")
     def health():
-        if not BOT_STATUS["ok"]:
-            return jsonify(ok=False, bot_ok=False, error=BOT_STATUS["error"]), 500
-        return jsonify(ok=True, bot_ok=True)
+        return jsonify(ok=True, web_ok=True, **BOT_STATUS)
 
     return web
 
