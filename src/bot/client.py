@@ -1,5 +1,4 @@
 import logging
-
 from pyrogram import Client
 
 from src.config import load_config
@@ -21,20 +20,24 @@ def build_bot_app() -> Client:
         workers=50,
     )
 
-    # Attach config/db to app for easy access in handlers
     app.cfg = cfg  # type: ignore[attr-defined]
     app.db = db    # type: ignore[attr-defined]
 
-    # Register handlers
     from .handlers.start import start_handler
     from .handlers.help import help_handler
     from .handlers.cancel import cancel_handler
     from .handlers.links import links_handler
+    from .handlers.premium import premium_handler
+    from .handlers.broadcast import broadcast_handler
+    from .handlers.settings import settings_handler
 
     start_handler(app)
     help_handler(app)
     cancel_handler(app)
     links_handler(app)
+    premium_handler(app)
+    broadcast_handler(app)
+    settings_handler(app)
 
     @app.on_start()
     async def _on_start(_: Client):
