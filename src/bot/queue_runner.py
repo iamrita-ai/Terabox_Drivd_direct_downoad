@@ -77,7 +77,7 @@ async def _resolve_thumb_value_to_path(client: Client, value: str, out_path: str
 
 
 async def ensure_runner(client: Client, chat_id: int, thread_id: Optional[int]) -> None:
-    # If stale runner exists, TaskManager.has_runner() will auto clean it.
+    # stale runner auto-clean is in TaskManager.has_runner()
     if TASKS.has_runner(chat_id, thread_id):
         return
 
@@ -95,7 +95,6 @@ async def ensure_runner(client: Client, chat_id: int, thread_id: Optional[int]) 
                     raise
                 except Exception as e:
                     log.exception("Job failed: %r", e)
-                    # best-effort notify in log channel
                     try:
                         await send_log(client, f"❌ JOB CRASHED (runner)\nKey: {key}\nErr: {e!r}")
                     except Exception:
@@ -106,7 +105,6 @@ async def ensure_runner(client: Client, chat_id: int, thread_id: Optional[int]) 
                 if q.empty():
                     break
         finally:
-            # ALWAYS cleanup runner record
             TASKS.runners.pop(key, None)
 
     task = asyncio.create_task(_run())
@@ -115,11 +113,10 @@ async def ensure_runner(client: Client, chat_id: int, thread_id: Optional[int]) 
 
 async def _process_job(client: Client, item: dict, cancel_event: asyncio.Event) -> None:
     chat_id = item["chat_id"]
-    thread_id = item.get("thread_id")
     origin_msg_id = item.get("origin_msg_id")
     from_user_id = item.get("from_user_id")
     from_username = item.get("from_username")
-    chat_type = item.get("chat_type")  # "private" / "group" / "supergroup" / etc
+    chat_type = item.get("chat_type")  # "private" / "group" / "supergroup"
     links: List[str] = item.get("links", [])
 
     total_tasks = len(links)
@@ -136,17 +133,18 @@ async def _process_job(client: Client, item: dict, cancel_event: asyncio.Event) 
     custom_title = (settings.get("title") or "").strip() or None
     user_thumb_file_id = settings.get("thumb_file_id")
 
-    # IMPORTANT: redirect only if request came from PRIVATE chat
+    # IMPORTANT: redirect only if PRIVATE chat request
     deliver_chat_id = chat_id
-    if chat_type == "private" and thread_id is None:
+    if chat_type == "private":
         tc = settings.get("target_chat_id")
         if isinstance(tc, int):
             deliver_chat_id = tc
 
+    # Topics support without message_thread_id:
+    # We reply to the original message; Telegram will keep it in same topic/thread.
     status = await client.send_message(
         chat_id=deliver_chat_id,
         text=f"Task started: 0/{total_tasks}",
-        message_thread_id=thread_id,
         reply_to_message_id=origin_msg_id if deliver_chat_id == chat_id else None,
     )
     await try_pin(client, deliver_chat_id, status.id)
@@ -165,11 +163,10 @@ async def _process_job(client: Client, item: dict, cancel_event: asyncio.Event) 
     await send_log(
         client,
         f"🚀 JOB START\nUser: @{from_username} ({from_user_id})\n"
-        f"Chat: {chat_id} ({chat_type})\nDeliver: {deliver_chat_id}\nThread: {thread_id}\n"
+        f"Chat: {chat_id} ({chat_type})\nDeliver: {deliver_chat_id}\n"
         f"Premium: {is_prem}\nLinks({len(links)}):\n" + "\n".join(links),
     )
 
-    # Cache PDF env thumb to local path (once)
     cached_pdf_thumb: Optional[str] = None
     if client.cfg.PDF_THUMB:  # type: ignore[attr-defined]
         cached_pdf_thumb = await _resolve_thumb_value_to_path(
@@ -197,7 +194,6 @@ async def _process_job(client: Client, item: dict, cancel_event: asyncio.Event) 
         link_dir = str(Path(work_dir) / f"link_{idx}")
         os.makedirs(link_dir, exist_ok=True)
 
-        # progress edits from downloader thread -> schedule safely
         last_text = {"v": ""}
 
         def on_progress_text(t: str) -> None:
@@ -209,7 +205,6 @@ async def _process_job(client: Client, item: dict, cancel_event: asyncio.Event) 
             except Exception:
                 pass
 
-        # Download in thread
         try:
             await asyncio.to_thread(
                 download_any,
@@ -229,7 +224,6 @@ async def _process_job(client: Client, item: dict, cancel_event: asyncio.Event) 
             rm_any(link_dir)
             continue
 
-        # Collect produced files (folder support)
         files = [str(p) for p in Path(link_dir).rglob("*") if p.is_file()]
         if not files:
             failed += 1
@@ -238,8 +232,6 @@ async def _process_job(client: Client, item: dict, cancel_event: asyncio.Event) 
             rm_any(link_dir)
             continue
 
-        # If many files, zip them
-        send_paths: List[str] = []
         if len(files) == 1:
             send_paths = [files[0]]
         else:
@@ -248,7 +240,6 @@ async def _process_job(client: Client, item: dict, cancel_event: asyncio.Event) 
             zip_paths(zip_path, files, base_dir=link_dir)
             send_paths = [zip_path]
 
-        # Upload each
         for sp in send_paths:
             if cancel_event.is_set():
                 break
@@ -257,8 +248,6 @@ async def _process_job(client: Client, item: dict, cancel_event: asyncio.Event) 
             fname = Path(sp).name
             ext = _ext(sp)
 
-            # Thumb priority
-            thumb_path = None
             if ext == "pdf" and cached_pdf_thumb and os.path.exists(cached_pdf_thumb):
                 thumb_path = cached_pdf_thumb
             elif cached_user_thumb and os.path.exists(cached_user_thumb):
@@ -266,7 +255,6 @@ async def _process_job(client: Client, item: dict, cancel_event: asyncio.Event) 
             else:
                 thumb_path = make_thumbnail(sp, link_dir)
 
-            # Upload progress
             state = ProgressState(start_ts=time.time(), last_edit_ts=0.0)
             last_done = {"t": 0.0}
 
@@ -278,7 +266,6 @@ async def _process_job(client: Client, item: dict, cancel_event: asyncio.Event) 
                 txt = format_progress("Uploading", fname, current, total, state)
                 client.loop.create_task(edit_status(txt))  # type: ignore[attr-defined]
 
-            # Playable video: send_video + supports_streaming
             send_path_final = sp
             remux_tmp = None
             if _is_video(sp) and client.cfg.REMUX_TO_MP4 and ext != "mp4":  # type: ignore[attr-defined]
@@ -294,7 +281,6 @@ async def _process_job(client: Client, item: dict, cancel_event: asyncio.Event) 
                         supports_streaming=True,
                         thumb=thumb_path if thumb_path and os.path.exists(thumb_path) else None,
                         caption=f"✅ {Path(send_path_final).name}\nSize: {human_bytes(size)}",
-                        message_thread_id=thread_id,
                         reply_to_message_id=origin_msg_id if deliver_chat_id == chat_id else None,
                         progress=upload_progress,
                     )
@@ -304,7 +290,6 @@ async def _process_job(client: Client, item: dict, cancel_event: asyncio.Event) 
                         document=send_path_final,
                         thumb=thumb_path if thumb_path and os.path.exists(thumb_path) else None,
                         caption=f"✅ {Path(send_path_final).name}\nSize: {human_bytes(size)}",
-                        message_thread_id=thread_id,
                         reply_to_message_id=origin_msg_id if deliver_chat_id == chat_id else None,
                         progress=upload_progress,
                     )
@@ -316,10 +301,9 @@ async def _process_job(client: Client, item: dict, cancel_event: asyncio.Event) 
                 await edit_status(f"❌ Upload failed: {fname}\nReason: {e}")
                 await send_log(client, f"❌ UPLOAD FAILED\nUser: @{from_username} ({from_user_id})\nFile: {fname}\nURL: {url}\nReason: {e}")
 
-            # cleanup
             if remux_tmp:
                 rm_any(remux_tmp)
-            if thumb_path and thumb_path.startswith(link_dir):
+            if thumb_path and isinstance(thumb_path, str) and thumb_path.startswith(link_dir):
                 rm_any(thumb_path)
             rm_any(sp)
 
