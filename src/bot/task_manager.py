@@ -14,7 +14,8 @@ class RunningTask:
 
 class TaskManager:
     """
-    Per chat+topic queue. Part-2 me actual download/upload worker attach hoga.
+    Per chat+topic queue.
+    Includes protection against stale/dead runner tasks.
     """
     def __init__(self) -> None:
         self.queues: Dict[Tuple[int, Optional[int]], asyncio.Queue] = {}
@@ -33,14 +34,34 @@ class TaskManager:
         q = self.get_queue(chat_id, thread_id)
         await q.put(item)
 
+    def get_runner(self, chat_id: int, thread_id: Optional[int]) -> Optional[RunningTask]:
+        return self.runners.get(self.get_key(chat_id, thread_id))
+
     def has_runner(self, chat_id: int, thread_id: Optional[int]) -> bool:
-        return self.get_key(chat_id, thread_id) in self.runners
+        """
+        True only if there is an active runner.
+        If runner task is done/crashed, remove it and return False.
+        """
+        key = self.get_key(chat_id, thread_id)
+        r = self.runners.get(key)
+        if not r:
+            return False
+
+        if r.task.done():
+            # stale runner cleanup (IMPORTANT)
+            try:
+                exc = r.task.exception()
+                if exc:
+                    log.error("Stale runner crashed for %s: %r", key, exc)
+            except Exception:
+                pass
+            self.runners.pop(key, None)
+            return False
+
+        return True
 
     def set_runner(self, chat_id: int, thread_id: Optional[int], running: RunningTask) -> None:
         self.runners[self.get_key(chat_id, thread_id)] = running
-
-    def get_runner(self, chat_id: int, thread_id: Optional[int]) -> Optional[RunningTask]:
-        return self.runners.get(self.get_key(chat_id, thread_id))
 
     async def cancel(self, chat_id: int, thread_id: Optional[int]) -> bool:
         key = self.get_key(chat_id, thread_id)
