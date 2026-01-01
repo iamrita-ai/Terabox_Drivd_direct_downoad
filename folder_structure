@@ -1,0 +1,21 @@
+repo/
+├─ app.py
+├─ requirements.txt
+├─ Dockerfile
+├─ .gitignore
+├─ README.md
+└─ src/
+   ├─ __init__.py
+   ├─ config.py
+   ├─ logger.py
+   ├─ db.py
+   └─ bot/
+      ├─ __init__.py
+      ├─ client.py
+      ├─ task_manager.py
+      └─ handlers/
+         ├─ __init__.py
+         ├─ common.py
+         ├─ start.py
+         ├─ help.py
+         └─ cancel.py
