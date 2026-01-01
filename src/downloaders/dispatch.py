@@ -16,9 +16,12 @@ def download_any(
     interval_sec: int = 8,
     cancel_event=None,
     max_bytes: Optional[int] = None,
+    rate_limit_bps: Optional[float] = None,
 ) -> Tuple[str, str]:
     r = resolve_provider(url)
+
     if r.provider == "gdrive":
+        # gdown doesn't support reliable throttling/progress callbacks
         return download_gdrive(
             r.url, out_dir,
             on_progress_text=on_progress_text,
@@ -26,6 +29,7 @@ def download_any(
             cancel_event=cancel_event,
             max_bytes=max_bytes,
         )
+
     if r.provider == "terabox":
         return download_terabox(
             r.url, out_dir,
@@ -33,11 +37,14 @@ def download_any(
             interval_sec=interval_sec,
             cancel_event=cancel_event,
             max_bytes=max_bytes,
+            rate_limit_bps=rate_limit_bps,
         )
+
     return download_direct(
         r.url, out_dir,
         on_progress_text=on_progress_text,
         interval_sec=interval_sec,
         cancel_event=cancel_event,
         max_bytes=max_bytes,
+        rate_limit_bps=rate_limit_bps,
     )
