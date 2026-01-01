@@ -35,7 +35,7 @@ def _tb_session() -> requests.Session:
 
     ck = os.getenv("TERABOX_COOKIES", "").strip()
     if ck:
-        # IMPORTANT: single-line cookie header string
+        # Single line: k=v; k2=v2
         s.headers["cookie"] = ck
 
     return s
@@ -81,17 +81,23 @@ def _detect_block(html: str, final_url: str) -> None:
     h = (html or "").lower()
     u = (final_url or "").lower()
 
-    # Cloudflare / anti-bot
-    if ("cloudflare" in h) and ("attention required" in h or "cf-browser-verification" in h or "/cdn-cgi/" in h):
+    # Cloudflare / anti-bot (common on 1024tera)
+    if (
+        "cloudflare" in h
+        or "just a moment" in h
+        or "checking your browser" in h
+        or "/cdn-cgi/" in h
+        or "cf-browser-verification" in h
+    ):
         raise RuntimeError(
             "TeraBox: Cloudflare/anti-bot page received. "
-            "Add Cloudflare cookies (e.g., cf_clearance) to TERABOX_COOKIES, then retry."
+            "You must include Cloudflare cookies like cf_clearance (and sometimes __cf_bm) in TERABOX_COOKIES."
         )
 
     # Login/redirect
-    if ("login" in u) or ("passport" in u) or ("signin" in h and "password" in h):
+    if ("login" in u) or ("passport" in u) or ("signin" in u) or ("sign in" in h and "password" in h):
         raise RuntimeError(
-            "TeraBox: redirected to login. TERABOX_COOKIES missing/expired or wrong domain."
+            "TeraBox: redirected to login. TERABOX_COOKIES missing/expired or wrong domain cookies."
         )
 
 
@@ -108,7 +114,6 @@ def _extract_meta_from_text(text: str) -> Optional[Tuple[str, str, str, str]]:
     """
     Try many patterns to get sign/timestamp/shareid/uk from HTML/JS text.
     """
-    # sign
     sign = None
     for pat in [
         r'"sign"\s*:\s*"([^"]+)"',
@@ -121,7 +126,6 @@ def _extract_meta_from_text(text: str) -> Optional[Tuple[str, str, str, str]]:
             sign = m.group(1)
             break
 
-    # timestamp
     ts = None
     for pat in [
         r'"timestamp"\s*:\s*(\d+)',
@@ -133,7 +137,6 @@ def _extract_meta_from_text(text: str) -> Optional[Tuple[str, str, str, str]]:
             ts = m.group(1)
             break
 
-    # shareid
     shareid = None
     for pat in [
         r'"shareid"\s*:\s*(\d+)',
@@ -146,7 +149,6 @@ def _extract_meta_from_text(text: str) -> Optional[Tuple[str, str, str, str]]:
             shareid = m.group(1)
             break
 
-    # uk
     uk = None
     for pat in [
         r'"uk"\s*:\s*(\d+)',
@@ -179,10 +181,7 @@ def _deep_find(obj: Any, key: str) -> Optional[Any]:
     return None
 
 
-def _meta_from_share_list(sess: requests.Session, base: str, surl: str, referer: str) -> Optional[Tuple[str, str, str, str]]:
-    """
-    Fallback: sometimes share/list JSON contains these fields.
-    """
+def _share_list_json(sess: requests.Session, base: str, surl: str, referer: str, dir_path: str = "") -> Dict[str, Any]:
     url = f"{base}/share/list"
     params = {
         "app_id": "250528",
@@ -190,56 +189,70 @@ def _meta_from_share_list(sess: requests.Session, base: str, surl: str, referer:
         "channel": "dubox",
         "clienttype": "0",
         "shorturl": surl,
-        "root": "1",
-        "dir": "",
-        "num": "50",
-        "page": "1",
-        "order": "name",
-        "desc": "0",
-    }
-    r = sess.get(url, params=params, timeout=30, headers={"referer": referer})
-    r.raise_for_status()
-    data = r.json()
-
-    errno = data.get("errno", 0)
-    if str(errno) != "0":
-        # if cookies missing, errno often non-zero
-        raise RuntimeError(f"TeraBox list error: errno={errno}")
-
-    sign = _deep_find(data, "sign")
-    ts = _deep_find(data, "timestamp")
-    shareid = _deep_find(data, "shareid") or _deep_find(data, "share_id") or _deep_find(data, "shareId")
-    uk = _deep_find(data, "uk") or _deep_find(data, "share_uk")
-
-    if sign and ts and shareid and uk:
-        return str(sign), str(ts), str(shareid), str(uk)
-    return None
-
-
-def _list_dir(sess: requests.Session, base: str, surl: str, dir_path: Optional[str]) -> List[TBItem]:
-    url = f"{base}/share/list"
-    is_root = (not dir_path) or (dir_path == "/")
-    params = {
-        "app_id": "250528",
-        "web": "1",
-        "channel": "dubox",
-        "clienttype": "0",
-        "shorturl": surl,
-        "root": "1" if is_root else "0",
-        "dir": "" if is_root else (dir_path or ""),
+        "root": "1" if not dir_path else "0",
+        "dir": dir_path,
         "num": "1000",
         "page": "1",
         "order": "name",
         "desc": "0",
     }
-    r = sess.get(url, params=params, timeout=30, headers={"referer": f"{base}/s/{surl}"})
+    r = sess.get(url, params=params, timeout=30, headers={"referer": referer, "x-requested-with": "XMLHttpRequest"})
     r.raise_for_status()
-    data: Dict[str, Any] = r.json()
-
+    data = r.json()
     errno = data.get("errno", 0)
     if str(errno) != "0":
         raise RuntimeError(f"TeraBox list error: errno={errno}")
+    return data
 
+
+def _meta_from_list_and_tplconfig(sess: requests.Session, base: str, surl: str, referer: str) -> Optional[Tuple[str, str, str, str]]:
+    """
+    Strong fallback:
+    1) share/list -> get shareid + uk (often available)
+    2) share/tplconfig (or variants) -> get sign + timestamp
+    """
+    data = _share_list_json(sess, base, surl, referer, dir_path="")
+
+    shareid = _deep_find(data, "shareid") or _deep_find(data, "share_id") or _deep_find(data, "shareId")
+    uk = _deep_find(data, "uk") or _deep_find(data, "share_uk")
+
+    # Sometimes list already includes sign/timestamp too:
+    sign = _deep_find(data, "sign")
+    ts = _deep_find(data, "timestamp")
+    if sign and ts and shareid and uk:
+        return str(sign), str(ts), str(shareid), str(uk)
+
+    if not (shareid and uk):
+        return None
+
+    candidates = [
+        (f"{base}/share/tplconfig", {"app_id": "250528", "shareid": shareid, "uk": uk, "fields": "sign,timestamp"}),
+        (f"{base}/share/tplconfig", {"app_id": "250528", "shareid": shareid, "uk": uk}),
+        (f"{base}/sharing/tplconfig", {"app_id": "250528", "shareid": shareid, "uk": uk}),
+        (f"{base}/share/init", {"app_id": "250528", "shareid": shareid, "uk": uk}),
+    ]
+
+    for url, params in candidates:
+        try:
+            r = sess.get(url, params=params, timeout=30, headers={"referer": referer, "x-requested-with": "XMLHttpRequest"})
+            if "application/json" not in (r.headers.get("content-type", "").lower()):
+                continue
+            j = r.json()
+            errno = j.get("errno", 0)
+            if str(errno) != "0":
+                continue
+            sign2 = _deep_find(j, "sign")
+            ts2 = _deep_find(j, "timestamp")
+            if sign2 and ts2:
+                return str(sign2), str(ts2), str(shareid), str(uk)
+        except Exception:
+            continue
+
+    return None
+
+
+def _list_dir(sess: requests.Session, base: str, surl: str, dir_path: Optional[str]) -> List[TBItem]:
+    data = _share_list_json(sess, base, surl, referer=f"{base}/s/{surl}", dir_path="" if not dir_path or dir_path == "/" else dir_path)
     lst = data.get("list") or []
     out: List[TBItem] = []
     for x in lst:
@@ -282,9 +295,9 @@ def _get_dlink(sess: requests.Session, base: str, surl: str, fs_id: int, sign: s
         "fid_list": f"[{fs_id}]",
     }
 
-    r = sess.get(url, params=params, timeout=30, headers={"referer": f"{base}/s/{surl}"})
+    r = sess.get(url, params=params, timeout=30, headers={"referer": f"{base}/s/{surl}", "x-requested-with": "XMLHttpRequest"})
     if r.status_code >= 400:
-        r = sess.post(url, data=params, timeout=30, headers={"referer": f"{base}/s/{surl}"})
+        r = sess.post(url, data=params, timeout=30, headers={"referer": f"{base}/s/{surl}", "x-requested-with": "XMLHttpRequest"})
 
     r.raise_for_status()
     data = r.json()
@@ -316,32 +329,32 @@ def download_terabox(
 
     base, surl, fsid, dir_path, file_name = _parse_link(url)
     sess = _tb_session()
-
     referer = f"{base}/s/{surl}"
 
-    # 1) Fetch HTML (try the exact url first, then /s/<surl>)
+    # Fetch HTML (try exact url then /s/<surl>)
     html = ""
     try:
-        html, _final = _fetch(sess, url, referer=referer)
+        html, _ = _fetch(sess, url, referer=referer)
     except Exception:
-        html, _final = _fetch(sess, f"{base}/s/{surl}", referer=base)
+        html, _ = _fetch(sess, f"{base}/s/{surl}", referer=base)
 
-    # 2) Meta from HTML
+    # 1) Meta from HTML
     meta = _extract_meta_from_text(html)
 
-    # 3) Fallback: meta from share/list JSON
+    # 2) Strong fallback: share/list + tplconfig
     if not meta:
-        meta = _meta_from_share_list(sess, base, surl, referer=referer)
+        meta = _meta_from_list_and_tplconfig(sess, base, surl, referer=referer)
 
     if not meta:
         raise RuntimeError(
             "TeraBox: could not extract sign/timestamp/shareid/uk. "
-            "This usually means cookies are missing/expired OR the site returned a blocked/login page."
+            "If you are using 1024tera, most likely Cloudflare is blocking requests. "
+            "Add cf_clearance (and sometimes __cf_bm) to TERABOX_COOKIES, then retry."
         )
 
     sign, timestamp, shareid, uk = meta
 
-    # If fsid exists (videoPlay link), download only that file
+    # targets
     targets: List[TBItem]
     if fsid:
         targets = [TBItem(isdir=0, name=file_name or "file", path=dir_path or "", size=0, fs_id=fsid)]
@@ -354,11 +367,7 @@ def download_terabox(
     first_path = ""
     first_name = ""
 
-    dl_headers = {
-        "referer": referer,
-        "user-agent": sess.headers.get("user-agent", ""),
-        # cookie already set in session headers if TERABOX_COOKIES provided
-    }
+    dl_headers = {"referer": referer, "user-agent": sess.headers.get("user-agent", "")}
 
     for idx, it in enumerate(targets, start=1):
         if cancel_event and cancel_event.is_set():
